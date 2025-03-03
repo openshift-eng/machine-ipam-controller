@@ -2,21 +2,26 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"os"
 	"strings"
 	"sync"
 
+	"github.com/emicklei/go-restful/v3/log"
+	"github.com/go-logr/logr"
 	osclientset "github.com/openshift/client-go/config/clientset/versioned"
 	mapiclientset "github.com/openshift/client-go/machine/clientset/versioned"
 	"github.com/pkg/errors"
-	log "github.com/sirupsen/logrus"
+
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
-	"k8s.io/klog/v2/klogr"
 	ipamv1 "sigs.k8s.io/cluster-api/exp/ipam/api/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -30,36 +35,60 @@ import (
 )
 
 var (
-	mgr              manager.Manager
-	mu               sync.Mutex
-	reservedMachines = map[string]struct{}{}
+	mu sync.Mutex
 )
 
 func main() {
-	logger := klogr.New()
-	ctrl.SetLogger(logger)
+
+	// Parse command-line arguments
+	flag.Parse()
+
+	logf.SetLogger(zap.New())
+
+	log := logf.Log.WithName("main")
+
+	ctrl.SetLogger(log)
 
 	mgr, err := manager.New(config.GetConfigOrDie(), manager.Options{})
 	if err != nil {
-		log.Errorf("could not create manager")
+		log.Error(err, "could not create manager")
 		os.Exit(1)
 	}
-	osclientset.NewForConfig(config.GetConfigOrDie())
+	_, err = osclientset.NewForConfig(config.GetConfigOrDie())
+	if err != nil {
+		log.Error(err, "could not create osclientset")
+		os.Exit(1)
+	}
 
-	mapiclientset.NewForConfig(config.GetConfigOrDie())
+	_, err = mapiclientset.NewForConfig(config.GetConfigOrDie())
+	if err != nil {
+		log.Error(err, "could not create mapiclientset")
+		os.Exit(1)
+	}
 
 	// Register object scheme to allow deserialization
-	ipamv1.AddToScheme(mgr.GetScheme())
-	ipamcontrollerv1.AddToScheme(mgr.GetScheme())
+	err = ipamv1.AddToScheme(mgr.GetScheme())
+	if err != nil {
+		log.Error(err, "could not add ipamv1 to scheme")
+		os.Exit(1)
+	}
 
-	if err := (&IPPoolClaimProcessor{}).
-		SetupWithManager(mgr); err != nil {
+	err = ipamcontrollerv1.AddToScheme(mgr.GetScheme())
+	if err != nil {
+		log.Error(err, "could not add ipamcontrollerv1 to scheme")
+		os.Exit(1)
+	}
+
+	if err := (&IPPoolClaimProcessor{
+		log: log,
+	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to create controller", "controller", "IPPoolClaimController")
 		os.Exit(1)
 	}
 
-	if err := (&IPPoolController{}).
-		SetupWithManager(mgr); err != nil {
+	if err := (&IPPoolController{
+		log: log,
+	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to create controller", "controller", "IPPoolController")
 		os.Exit(1)
 	}
@@ -76,6 +105,7 @@ type IPPoolClaimProcessor struct {
 	Recorder       record.EventRecorder
 	RESTMapper     meta.RESTMapper
 	UncachedClient client.Client
+	log            logr.Logger
 }
 
 type IPPoolController struct {
@@ -84,23 +114,24 @@ type IPPoolController struct {
 	Recorder       record.EventRecorder
 	RESTMapper     meta.RESTMapper
 	UncachedClient client.Client
+	log            logr.Logger
 }
 
 func (a *IPPoolClaimProcessor) BindClaim(ctx context.Context, ipAddressClaim *ipamv1.IPAddressClaim) error {
-	log.Info("Received BindClaim")
+	a.log.Info("Received BindClaim")
 	ip, err := mgmt.GetIPAddress(ctx, ipAddressClaim)
 	if err != nil {
-		log.Errorf("Unable to get IPAddress: %v", err)
+		a.log.Error(err, "Unable to get IPAddress")
 		return err
 	}
-	log.Infof("Got IPAddress %v", ip)
+	a.log.Info("Got IPAddress %v", ip)
 
 	// create ipaddress object
 	if err = a.Client.Create(ctx, ip); err != nil {
-		log.Errorf("Unable to create IPAddress: %v", err)
+		a.log.Error(err, "Unable to create IPAddress")
 		err2 := mgmt.ReleaseIPConfiguration(ctx, ip)
 		if err2 != nil {
-			log.Errorf("Unable to release IPAddress: %v", err2)
+			a.log.Error(err, "Unable to release IPAddress")
 			return errors.Wrap(err, "Unable to release IPAddress")
 		}
 		return err
@@ -111,26 +142,26 @@ func (a *IPPoolClaimProcessor) BindClaim(ctx context.Context, ipAddressClaim *ip
 		},
 	}
 	if err = a.Client.Status().Update(ctx, ipAddressClaim); err != nil {
-		log.Errorf("Unable to update claim: %v", err)
+		a.log.Error(err, "Unable to update claim")
 		return err
 	}
 
-	log.Infof("IAC: %v", ipAddressClaim)
+	log.Printf("IAC: %v", ipAddressClaim)
 	return nil
 }
 
 func (a *IPPoolClaimProcessor) ReleaseClaim(ctx context.Context, namespacedName types.NamespacedName) error {
-	log.Info("Received ReleaseClaim")
+	a.log.Info("Received ReleaseClaim")
 	ipAddress := &ipamv1.IPAddress{}
 	if err := a.Get(ctx, namespacedName, ipAddress); err != nil {
 		return err
 	}
-	log.Infof("Got IPAddress %v (%v)", ipAddress.Name, ipAddress.Spec.Address)
+	a.log.Info(fmt.Sprintf("Got IPAddress %v (%v)", ipAddress.Name, ipAddress.Spec.Address))
 	if err := mgmt.ReleaseIPConfiguration(ctx, ipAddress); err != nil {
-		log.Warnf("Unable to release IP: %v", err)
+		a.log.Error(err, "Unable to release IP")
 		return err
 	}
-	log.Infof("Deleting ipaddress CR %v", ipAddress.Name)
+	a.log.Info(fmt.Sprintf("Deleting ipaddress CR %v", ipAddress.Name))
 	err := a.Delete(ctx, ipAddress)
 	return err
 }
@@ -156,29 +187,29 @@ func (a *IPPoolClaimProcessor) Reconcile(ctx context.Context, req reconcile.Requ
 	mu.Lock()
 	defer mu.Unlock()
 
-	log.Infof("Reconciling request %v", req)
-	defer log.Infof("Finished reconciling request %v", req)
+	a.log.Info(fmt.Sprintf("Reconciling request %v", req))
+	defer a.log.Info(fmt.Sprintf("Finished reconciling request %v", req))
 
 	ipAddressClaim := &ipamv1.IPAddressClaim{}
 	claimKey := client.ObjectKey{Namespace: req.Namespace, Name: req.Name}
 
 	if err := a.Get(ctx, claimKey, ipAddressClaim); err != nil {
-		log.Warnf("Got error: %v", err)
-		if strings.Contains(fmt.Sprintf("%v%", err), "not found") {
-			log.Info("Handling remove of claim")
-			a.ReleaseClaim(ctx, req.NamespacedName)
+		a.log.Error(err, "Got error")
+		if strings.Contains(fmt.Sprintf("%v", err), "not found") {
+			a.log.Info("Handling remove of claim")
+			_ = a.ReleaseClaim(ctx, req.NamespacedName)
 			return reconcile.Result{}, nil
 		}
 		return reconcile.Result{}, err
 	}
-	log.Infof("Got IPAddressClaim %v", ipAddressClaim.Name)
+	a.log.Info(fmt.Sprintf("Got IPAddressClaim %v", ipAddressClaim.Name))
 
 	// Check claim to see if it needs IP from a pool that we own.
 	poolRef := ipAddressClaim.Spec.PoolRef
-	log.Debugf("Kind(%v) Group(%v) Name(%v)", poolRef.Kind, *poolRef.APIGroup, poolRef.Name)
+	a.log.V(4).Info(fmt.Sprintf("Kind(%v) Group(%v) Name(%v)", poolRef.Kind, *poolRef.APIGroup, poolRef.Name))
 
 	if poolRef.Kind == ipamcontrollerv1.IPPoolKind && *poolRef.APIGroup == ipamcontrollerv1.APIGroupName {
-		log.Debugf("Found a claim for an IP from this provider.  Status: %v", ipAddressClaim.Status)
+		a.log.V(4).Info(fmt.Sprintf("Found a claim for an IP from this provider.  Status: %v", ipAddressClaim.Status))
 		if ipAddressClaim.Status.AddressRef.Name == "" {
 			err := a.BindClaim(ctx, ipAddressClaim)
 			if err != nil {
@@ -186,7 +217,7 @@ func (a *IPPoolClaimProcessor) Reconcile(ctx context.Context, req reconcile.Requ
 			}
 		} else {
 			// Status was set.  Verify address still exists?
-			log.Info("Ignoring claim due to address already in status")
+			a.log.Info("Ignoring claim due to address already in status")
 		}
 	}
 
@@ -195,12 +226,12 @@ func (a *IPPoolClaimProcessor) Reconcile(ctx context.Context, req reconcile.Requ
 
 func (a *IPPoolClaimProcessor) InjectClient(c client.Client) error {
 	a.Client = c
-	log.Info("Set client for claim processor")
+	a.log.Info("Set client for claim processor")
 	return nil
 }
 
 func (a *IPPoolController) LoadPool(ctx context.Context, pool *ipamcontrollerv1.IPPool) error {
-	log.Infof("Loading pool: %v", pool.Name)
+	a.log.V(4).Info(fmt.Sprintf("Loading pool: %v", pool.Name))
 
 	// Initialize pool
 	err := mgmt.InitializePool(ctx, pool)
@@ -214,12 +245,12 @@ func (a *IPPoolController) LoadPool(ctx context.Context, pool *ipamcontrollerv1.
 		err = a.List(ctx, &ipList, &options)
 		for _, ip := range ipList.Items {
 			if ip.Spec.PoolRef.Name == pool.Name {
-				log.Infof("Found IP: %v", ip.Spec.Address)
+				a.log.Info(fmt.Sprintf("Found IP: %v", ip.Spec.Address))
 				err = mgmt.ClaimIPAddress(ctx, pool, ip)
 				if err != nil {
-					log.Warnf("An error occurred when trying to claim IP %v: %v", ip.Spec.Address, err)
+					a.log.Error(err, fmt.Sprintf("An error occurred when trying to claim IP %v: %v", ip.Spec.Address, err))
 				} else {
-					log.Debugf("IP %v is not part of pool %v", ip.Spec.Address, pool.Name)
+					a.log.Info(fmt.Sprintf("IP %v is not part of pool %v", ip.Spec.Address, pool.Name))
 				}
 			}
 		}
@@ -228,31 +259,34 @@ func (a *IPPoolController) LoadPool(ctx context.Context, pool *ipamcontrollerv1.
 }
 
 func (a *IPPoolController) RemovePool(ctx context.Context, pool string) error {
-	log.Infof("Removing pool %v", pool)
+	a.log.Info(fmt.Sprintf("Removing pool %v", pool))
 	ipAddresses := &ipamv1.IPAddressList{}
 	err := a.Client.List(ctx, ipAddresses)
 	if err != nil {
-		log.Warnf("Unable to get IPAddresses: %v", err)
+		a.log.Error(err, "Unable to get IPAddresses")
 		return err
 	}
 
-	log.Info("Searching for linked IPAddresses...")
+	a.log.Info("Searching for linked IPAddresses...")
 	for _, ip := range ipAddresses.Items {
-		log.Debugf("Checking IPAddress: %v", ip.Name)
+		a.log.Info(fmt.Sprintf("Checking IPAddress: %v", ip.Name))
 		if fmt.Sprintf("%v/%v", ip.Namespace, ip.Spec.PoolRef.Name) == pool {
-			log.Infof("Deleting ipaddress CR %v", ip.Name)
-			mgmt.ReleaseIPConfiguration(ctx, &ip)
+			a.log.Info(fmt.Sprintf("Deleting ipaddress CR %v", ip.Name))
+			err = mgmt.ReleaseIPConfiguration(ctx, &ip)
+			if err != nil {
+				a.log.Error(err, "Error occurred while releasing IP")
+			}
 			err = a.Delete(ctx, &ip)
 			if err != nil {
-				log.Warnf("Error occurred while cleaning up IP: %v", err)
+				a.log.Error(err, "Error occurred while cleaning up IP")
 			}
 		}
 	}
 
-	log.Info("Removing pool from mgmt...")
+	a.log.Info("Removing pool from mgmt...")
 	err = mgmt.RemovePool(ctx, pool)
 	if err != nil {
-		log.Warnf("Error removing pool from mgmt: %v", err)
+		a.log.Error(err, "Error removing pool from mgmt")
 	}
 	return err
 }
@@ -278,30 +312,30 @@ func (a *IPPoolController) Reconcile(ctx context.Context, req reconcile.Request)
 	mu.Lock()
 	defer mu.Unlock()
 
-	log.Infof("Reconciling request %v", req)
-	defer log.Infof("Finished reconciling request %v", req)
+	a.log.Info(fmt.Sprintf("Reconciling request %v", req))
+	defer a.log.Info(fmt.Sprintf("Finished reconciling request %v", req))
 
 	pool := &ipamcontrollerv1.IPPool{}
 	poolKey := client.ObjectKey{Namespace: req.Namespace, Name: req.Name}
 
 	if err := a.Get(ctx, poolKey, pool); err != nil {
-		log.Warnf("Got error: %v", err)
+		a.log.Error(err, "got error")
 		switch t := err.(type) {
 		default:
-			log.Infof("Type: %v", t)
+			a.log.Info(fmt.Sprintf("Type: %v", t))
 
 		}
 		if strings.Contains(fmt.Sprintf("%v", err), "not found") {
-			log.Info("Handling remove of claim")
-			a.RemovePool(ctx, fmt.Sprintf("%v", req))
+			a.log.Info("Handling remove of claim")
+			_ = a.RemovePool(ctx, fmt.Sprintf("%v", req))
 			return reconcile.Result{}, nil
 		} else {
 			return reconcile.Result{}, err
 		}
 	}
-	log.Infof("Got Pool %v", pool.Name)
+	a.log.Info(fmt.Sprintf("Got Pool %v", pool.Name))
 	if err := a.LoadPool(ctx, pool); err != nil {
-		log.Errorf("Unable to load pool: %v", err)
+		a.log.Error(err, "Unable to load pool")
 		return reconcile.Result{}, err
 	}
 
